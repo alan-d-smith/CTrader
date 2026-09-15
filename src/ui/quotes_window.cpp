@@ -1,17 +1,45 @@
 #include "quotes_window.hpp"
 #include "imgui.h"
+#include "price_chart.hpp"
 
-bool draw_quotes_window(std::string& symbols_csv,
-                        float& refresh_seconds,
-                        bool& auto_refresh,
+#include <algorithm>
+#include <cstdio>
+#include <ctime>
+#include <utility>
+
+namespace {
+std::string trim(const std::string& s) {
+    const size_t a = s.find_first_not_of(" \t\r\n");
+    const size_t b = s.find_last_not_of(" \t\r\n");
+    if (a == std::string::npos) return {};
+    return s.substr(a, b - a + 1);
+}
+} // namespace
+
+void draw_quotes_window(std::vector<std::string>& symbols,
                         bool last_request_ok,
                         const std::string& last_error,
                         const std::vector<QuoteRow>& quotes,
-                        std::string& api_key,
-                        bool& reveal_api_key,
-                        const request_debug_view* dbg)
+                        const request_debug_view* dbg,
+                        std::chrono::system_clock::time_point last_sync,
+                        const std::vector<LogEntry>& log_lines,
+                        // chart (OHLC):
+                        std::string& selected_symbol,
+                        int& chart_minutes,
+                        std::string& chart_interval,
+                        bool& refresh_chart_out,
+                        bool& granularity_changed_out,
+                        bool& symbol_changed_out,
+                        const std::vector<double>& chart_xs,
+                        const std::vector<double>& chart_opens,
+                        const std::vector<double>& chart_highs,
+                        const std::vector<double>& chart_lows,
+                        const std::vector<double>& chart_closes)
+
 {
-    bool fetch_clicked = false;
+    refresh_chart_out = false;
+    granularity_changed_out = false;
+    symbol_changed_out = false;
 
     // ---- Viewport settings ----
     ImGuiViewport* vp = ImGui::GetMainViewport();
@@ -29,133 +57,260 @@ bool draw_quotes_window(std::string& symbols_csv,
 
     ImGui::Begin("CTrader - Quotes", nullptr, win_flags);
 
-    // --- API key row (Finnhub) ---
-    ImGui::TextUnformatted("Finnhub API key:");
-    ImGui::SameLine();
-    ImGui::Checkbox("Reveal", &reveal_api_key);
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(360.0f);
+    // ---- Bottom row height: sized to fit the ticker table's rows, with a floor ----
+    const float row_h = ImGui::GetTextLineHeightWithSpacing();
+    const float table_h = row_h * static_cast<float>(symbols.size() + 2);
+    const float bottom_h = table_h > 150.0f ? table_h : 150.0f;
 
-    // Mirrors api_key only when api_key changes externally.
-    static char keybuf[256] = {};
-    static std::string key_mirror;
+    // ---- Chart pane (top, full width) ----
+    const float chart_avail_h = ImGui::GetContentRegionAvail().y - bottom_h - ImGui::GetStyle().ItemSpacing.y;
+    const float chart_pane_h = chart_avail_h > 100.0f ? chart_avail_h : 100.0f;
 
-    if (key_mirror != api_key) {
-        std::snprintf(keybuf, sizeof(keybuf), "%s", api_key.c_str());
-        key_mirror = api_key;
-    }
-
-    ImGuiInputTextFlags key_flags = reveal_api_key ? 0 : ImGuiInputTextFlags_Password;
-    ImGui::InputText("##api_key", keybuf, IM_ARRAYSIZE(keybuf), key_flags);
-    ImGui::SameLine();
-    if (ImGui::Button("Apply")) { // Apply clicked
-        api_key = keybuf;
-        key_mirror = api_key;
-    }
-
-    ImGui::Separator();
-
-    // --- Controls ---
-    ImGui::TextUnformatted("Symbols (CSV):");
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(500.0f);
-    static char buf[256];
-    std::snprintf(buf, sizeof(buf), "%s", symbols_csv.c_str());
-    if (ImGui::InputText("##symbols", buf, IM_ARRAYSIZE(buf))) {
-        symbols_csv = buf;
-    }
-
-    ImGui::SameLine();
-    if (ImGui::Button("Fetch Now")) {
-        api_key = keybuf;
-        key_mirror = api_key;
-        fetch_clicked = true;
-    }
-
-    ImGui::SameLine();
-    ImGui::Checkbox("Auto refresh", &auto_refresh);
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(120.0f);
-    ImGui::InputFloat("every (s)", &refresh_seconds, 0.5f, 2.0f, "%.1f");
-    if (refresh_seconds < 1.0f) refresh_seconds = 1.0f;
-
-    // --- Status ---
-    if (last_request_ok) {
-        ImGui::TextColored(ImVec4(0.6f, 1.0f, 0.6f, 1.0f), "Status: OK");
-    } else {
-        ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.6f, 1.0f), "Status: ERROR - %s", last_error.c_str());
-    }
-
-    ImGui::Separator();
-
-    // --- Debug ---
-    if (!last_request_ok && dbg) {
-        if (ImGui::CollapsingHeader("Debug details", ImGuiTreeNodeFlags_DefaultOpen)) {
-            ImGui::TextWrapped("URL: %s", dbg->url.c_str());
-            ImGui::Text("HTTP status: %ld", dbg->http_status);
-            ImGui::Text("cURL code: %d", dbg->curl_code);
-            if (!dbg->curl_error.empty()) {
-                ImGui::TextWrapped("cURL error: %s", dbg->curl_error.c_str());
+    ImGui::BeginChild("chart_pane", ImVec2(0, chart_pane_h), false);
+    {
+        // Duration, split into days/hours/minutes but backed by the single
+        // chart_minutes value the fetch logic uses. Mirror it into the three
+        // fields only when it changes externally, so in-progress typing survives.
+        {
+            static int mirror_minutes = -1;
+            static int days = 0, hours = 0, mins = 0;
+            if (mirror_minutes != chart_minutes) {
+                days  = chart_minutes / (24 * 60);
+                hours = (chart_minutes % (24 * 60)) / 60;
+                mins  = chart_minutes % 60;
+                mirror_minutes = chart_minutes;
             }
-            if (!dbg->body_snippet.empty()) {
-                ImGui::SeparatorText("Response body");
-                ImGui::BeginChild("resp_snip", ImVec2(0, 120), true, ImGuiWindowFlags_HorizontalScrollbar);
-                ImGui::TextUnformatted(dbg->body_snippet.c_str());
-                ImGui::EndChild();
+
+            ImGui::TextUnformatted("Duration:");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(70.0f);
+            bool changed = ImGui::InputInt("days", &days);
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(70.0f);
+            changed |= ImGui::InputInt("hours", &hours);
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(70.0f);
+            changed |= ImGui::InputInt("minutes", &mins);
+
+            if (days < 0) days = 0;
+            if (hours < 0) hours = 0;
+            if (mins < 0) mins = 0;
+
+            if (changed) {
+                chart_minutes = days * 24 * 60 + hours * 60 + mins;
+                if (chart_minutes < 1) chart_minutes = 1;
+                mirror_minutes = chart_minutes;
             }
         }
+
+        // Granularity, as a row of standard broker-style interval buttons.
+        ImGui::TextUnformatted("Granularity:");
+        {
+            static const std::pair<const char*, const char*> options[] = {
+                {"1m", "1m"}, {"5m", "5m"}, {"15m", "15m"}, {"30m", "30m"},
+                {"1H", "60m"}, {"1D", "1d"}, {"1W", "1wk"}, {"1M", "1mo"},
+            };
+            for (const auto& [label, code] : options) {
+                ImGui::SameLine();
+                const bool selected = chart_interval == code;
+                if (selected) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyle().Colors[ImGuiCol_ButtonActive]);
+                if (ImGui::SmallButton(label) && chart_interval != code) {
+                    chart_interval = code;
+                    granularity_changed_out = true;
+                }
+                if (selected) ImGui::PopStyleColor();
+            }
+        }
+
+        ImGui::SameLine();
+        if (ImGui::Button("Refresh Chart")) {
+            refresh_chart_out = true;
+        }
+
+        const float chart_height = ImGui::GetContentRegionAvail().y > 100.0f
+            ? ImGui::GetContentRegionAvail().y
+            : 100.0f;
+        draw_price_chart(selected_symbol.empty() ? "Chart" : selected_symbol,
+                         chart_xs, chart_opens, chart_highs, chart_lows, chart_closes, chart_height);
+    }
+    ImGui::EndChild();
+
+    // ---- Bottom row: log (left) + ticker table (right, capped at half width) ----
+    const float avail_w = ImGui::GetContentRegionAvail().x;
+    const float table_w = avail_w * 0.5f;
+    const float log_w = avail_w - table_w - ImGui::GetStyle().ItemSpacing.x;
+
+    ImGui::BeginChild("log_pane", ImVec2(log_w, bottom_h), true);
+    {
+        const std::string status_str = last_request_ok ? "Status: OK" : ("Status: ERROR - " + last_error);
+        const ImVec4 status_col = last_request_ok ? ImVec4(0.6f, 1.0f, 0.6f, 1.0f) : ImVec4(1.0f, 0.6f, 0.6f, 1.0f);
+        ImGui::TextColored(status_col, "%s", status_str.c_str());
+
+        char synced_buf[32] = "Not synced yet";
+        if (last_sync.time_since_epoch().count() != 0) {
+            const std::time_t t = std::chrono::system_clock::to_time_t(last_sync);
+            std::tm tmv{};
+            localtime_s(&tmv, &t);
+            std::snprintf(synced_buf, sizeof(synced_buf), "Synced: %02d:%02d", tmv.tm_hour, tmv.tm_min);
+        }
+        ImGui::TextUnformatted(synced_buf);
+
         ImGui::Separator();
-    }
 
-    // --- Data Table ---
-    const ImGuiTableFlags flags_tbl = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
-                                  ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingFixedFit |
-                                  ImGuiTableFlags_ScrollY;
-
-    if (ImGui::BeginTable("quotes_table", 8, flags_tbl, ImVec2(0, 0))) {
-        ImGui::TableSetupScrollFreeze(0, 1);
-        ImGui::TableSetupColumn("Symbol", ImGuiTableColumnFlags_WidthFixed, 80.0f);
-        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch, 0.0f);
-
-        float col_w = ImGui::CalcTextSize("00000").x + ImGui::GetStyle().CellPadding.x * 2.0f;
-        ImGui::TableSetupColumn("Price",     ImGuiTableColumnFlags_WidthFixed, col_w);
-        ImGui::TableSetupColumn("Δ",         ImGuiTableColumnFlags_WidthFixed, col_w);
-        ImGui::TableSetupColumn("Δ%",        ImGuiTableColumnFlags_WidthFixed, col_w);
-        ImGui::TableSetupColumn("Low",       ImGuiTableColumnFlags_WidthFixed, col_w);
-        ImGui::TableSetupColumn("High",      ImGuiTableColumnFlags_WidthFixed, col_w);
-        ImGui::TableSetupColumn("CCY",       ImGuiTableColumnFlags_WidthFixed, col_w);
-
-        ImGui::TableHeadersRow();
-
-        for (const auto& q : quotes) {
-            ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(q.symbol.c_str());
-            ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(q.name.c_str());
-            ImGui::TableSetColumnIndex(2); ImGui::TextUnformatted(fmt_opt(q.price).c_str());
-
-            ImGui::TableSetColumnIndex(3);
-            if (q.change.has_value()) {
-                ImVec4 col = (*q.change >= 0.0) ? ImVec4(0.3f, 0.9f, 0.3f, 1.0f)
-                                                : ImVec4(1.0f, 0.3f, 0.3f, 1.0f);
-                ImGui::TextColored(col, "%s", fmt_opt(q.change).c_str());
-            } else ImGui::TextUnformatted("-");
-
-            ImGui::TableSetColumnIndex(4);
-            if (q.change_pct.has_value()) {
-                ImVec4 colp = (*q.change_pct >= 0.0) ? ImVec4(0.3f, 0.9f, 0.3f, 1.0f)
-                                                     : ImVec4(1.0f, 0.3f, 0.3f, 1.0f);
-                std::string s = fmt_opt(q.change_pct, 2) + "%";
-                ImGui::TextColored(colp, "%s", s.c_str());
-            } else ImGui::TextUnformatted("-");
-
-            ImGui::TableSetColumnIndex(5); ImGui::TextUnformatted(fmt_opt(q.day_low).c_str());
-            ImGui::TableSetColumnIndex(6); ImGui::TextUnformatted(fmt_opt(q.day_high).c_str());
-            ImGui::TableSetColumnIndex(7); ImGui::TextUnformatted(q.currency.empty() ? "-" : q.currency.c_str());
+        if (!last_request_ok && dbg) {
+            if (ImGui::CollapsingHeader("Debug details", ImGuiTreeNodeFlags_DefaultOpen)) {
+                ImGui::TextWrapped("URL: %s", dbg->url.c_str());
+                ImGui::Text("HTTP status: %ld", dbg->http_status);
+                ImGui::Text("cURL code: %d", dbg->curl_code);
+                if (!dbg->curl_error.empty()) {
+                    ImGui::TextWrapped("cURL error: %s", dbg->curl_error.c_str());
+                }
+                if (!dbg->body_snippet.empty()) {
+                    ImGui::SeparatorText("Response body");
+                    ImGui::BeginChild("resp_snip", ImVec2(0, 120), true, ImGuiWindowFlags_HorizontalScrollbar);
+                    ImGui::TextUnformatted(dbg->body_snippet.c_str());
+                    ImGui::EndChild();
+                }
+            }
+            ImGui::Separator();
         }
-        ImGui::EndTable();
+
+        // Persistent history of status changes - unlike the summary line
+        // above, entries here stay even after the state clears back to OK.
+        ImGui::BeginChild("log_scroll", ImVec2(0, 0), false);
+        for (const auto& entry : log_lines) {
+            ImVec4 col;
+            switch (entry.level) {
+                case LogLevel::Error:   col = ImVec4(1.0f, 0.5f, 0.5f, 1.0f); break;
+                case LogLevel::Success: col = ImVec4(0.5f, 1.0f, 0.5f, 1.0f); break;
+                default:                col = ImGui::GetStyle().Colors[ImGuiCol_Text]; break;
+            }
+            ImGui::PushStyleColor(ImGuiCol_Text, col);
+            ImGui::TextWrapped("%s", entry.text.c_str());
+            ImGui::PopStyleColor();
+        }
+        if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 1.0f) {
+            ImGui::SetScrollHereY(1.0f);
+        }
+        ImGui::EndChild();
     }
+    ImGui::EndChild();
+
+    ImGui::SameLine();
+
+    ImGui::BeginChild("table_pane", ImVec2(0, bottom_h), false);
+    {
+        const ImGuiTableFlags flags_tbl = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+                                      ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingFixedFit |
+                                      ImGuiTableFlags_ScrollY;
+
+        if (ImGui::BeginTable("quotes_table", 8, flags_tbl, ImVec2(0, table_h))) {
+            ImGui::TableSetupScrollFreeze(0, 1);
+            ImGui::TableSetupColumn("Symbol", ImGuiTableColumnFlags_WidthFixed, 80.0f);
+            ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch, 0.0f);
+
+            float col_w = ImGui::CalcTextSize("00000").x + ImGui::GetStyle().CellPadding.x * 2.0f;
+            ImGui::TableSetupColumn("Price",     ImGuiTableColumnFlags_WidthFixed, col_w);
+            ImGui::TableSetupColumn("Δ",         ImGuiTableColumnFlags_WidthFixed, col_w);
+            ImGui::TableSetupColumn("Δ%",        ImGuiTableColumnFlags_WidthFixed, col_w);
+            ImGui::TableSetupColumn("Low",       ImGuiTableColumnFlags_WidthFixed, col_w);
+            ImGui::TableSetupColumn("High",      ImGuiTableColumnFlags_WidthFixed, col_w);
+            ImGui::TableSetupColumn("CCY",       ImGuiTableColumnFlags_WidthFixed, col_w);
+
+            ImGui::TableHeadersRow();
+
+            auto find_quote = [&](const std::string& sym) -> const QuoteRow* {
+                for (const auto& q : quotes) if (q.symbol == sym) return &q;
+                return nullptr;
+            };
+
+            for (size_t i = 0; i < symbols.size(); ) {
+                ImGui::PushID(static_cast<int>(i));
+                ImGui::TableNextRow();
+
+                const QuoteRow* q = find_quote(symbols[i]);
+                bool erase_this = false;
+
+                ImGui::TableSetColumnIndex(0);
+                erase_this = ImGui::SmallButton("x");
+                ImGui::SameLine();
+                // Clicking the ticker itself charts it.
+                if (ImGui::Selectable(symbols[i].c_str(), symbols[i] == selected_symbol) &&
+                    symbols[i] != selected_symbol) {
+                    selected_symbol = symbols[i];
+                    symbol_changed_out = true;
+                }
+
+                ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(q ? q->name.c_str() : "-");
+                ImGui::TableSetColumnIndex(2); ImGui::TextUnformatted(q ? fmt_opt(q->price).c_str() : "-");
+
+                ImGui::TableSetColumnIndex(3);
+                if (q && q->change.has_value()) {
+                    ImVec4 col = (*q->change >= 0.0) ? ImVec4(0.3f, 0.9f, 0.3f, 1.0f)
+                                                     : ImVec4(1.0f, 0.3f, 0.3f, 1.0f);
+                    ImGui::TextColored(col, "%s", fmt_opt(q->change).c_str());
+                } else ImGui::TextUnformatted("-");
+
+                ImGui::TableSetColumnIndex(4);
+                if (q && q->change_pct.has_value()) {
+                    ImVec4 colp = (*q->change_pct >= 0.0) ? ImVec4(0.3f, 0.9f, 0.3f, 1.0f)
+                                                          : ImVec4(1.0f, 0.3f, 0.3f, 1.0f);
+                    std::string s = fmt_opt(q->change_pct, 2) + "%";
+                    ImGui::TextColored(colp, "%s", s.c_str());
+                } else ImGui::TextUnformatted("-");
+
+                ImGui::TableSetColumnIndex(5); ImGui::TextUnformatted(q ? fmt_opt(q->day_low).c_str() : "-");
+                ImGui::TableSetColumnIndex(6); ImGui::TextUnformatted(q ? fmt_opt(q->day_high).c_str() : "-");
+                ImGui::TableSetColumnIndex(7); ImGui::TextUnformatted(q && !q->currency.empty() ? q->currency.c_str() : "-");
+
+                ImGui::PopID();
+
+                if (erase_this) {
+                    const bool was_selected = (symbols[i] == selected_symbol);
+                    symbols.erase(symbols.begin() + i);
+                    if (was_selected) {
+                        selected_symbol = symbols.empty() ? std::string() : symbols.front();
+                        symbol_changed_out = true;
+                    }
+                } else {
+                    ++i;
+                }
+            }
+
+            // --- Add-symbol row ---
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            if (ImGui::SmallButton("+")) {
+                ImGui::OpenPopup("add_symbol_popup");
+            }
+
+            if (ImGui::BeginPopup("add_symbol_popup")) {
+                static char newsym[16] = "";
+                if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+                ImGui::SetNextItemWidth(100.0f);
+                const bool submitted = ImGui::InputText("##newsym", newsym, IM_ARRAYSIZE(newsym),
+                    ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_CharsUppercase);
+                ImGui::SameLine();
+                const bool add_clicked = ImGui::Button("Add");
+                if (submitted || add_clicked) {
+                    const std::string s = trim(newsym);
+                    if (!s.empty() && std::find(symbols.begin(), symbols.end(), s) == symbols.end()) {
+                        symbols.push_back(s);
+                        if (selected_symbol.empty()) {
+                            selected_symbol = s;
+                            symbol_changed_out = true;
+                        }
+                    }
+                    newsym[0] = '\0';
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::EndPopup();
+            }
+
+            ImGui::EndTable();
+        }
+    }
+    ImGui::EndChild();
 
     ImGui::End();
-
-    return fetch_clicked;
 }

@@ -29,3 +29,19 @@ QuoteRow parse_finnhub_quote_json(const std::string& payload, const std::string&
 
     return r;
 }
+
+std::string build_finnhub_profile_url(const std::string& symbol, const std::string& api_key) {
+    std::ostringstream oss;
+    oss << "https://finnhub.io/api/v1/stock/profile2?symbol=" << symbol << "&token=" << api_key;
+    return oss.str();
+}
+
+std::string parse_finnhub_profile_name(const std::string& payload) {
+    try {
+        auto j = json::parse(payload);
+        if (j.contains("name") && j["name"].is_string()) {
+            return j["name"].get<std::string>();
+        }
+    } catch (...) {}
+    return "";
+}

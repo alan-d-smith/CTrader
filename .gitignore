@@ -169,3 +169,12 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# CLion / CMake build output
+cmake-build-*/
+
+# JetBrains IDE
+.idea/
+
+# Dear ImGui runtime window-layout state
+imgui.ini

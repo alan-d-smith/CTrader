@@ -10,7 +10,7 @@ static size_t curl_write_to_string(void* contents, size_t size, size_t nmemb, vo
     return total;
 }
 
-http_result http_get_ex(const std::string& url, bool verbose) {
+http_result http_get_ex(const std::string& url, bool verbose, const std::string& user_agent) {
     http_result r;
     CURL* curl = curl_easy_init();
     if (!curl) { r.error = "curl_easy_init failed"; return r; }
@@ -19,7 +19,7 @@ http_result http_get_ex(const std::string& url, bool verbose) {
     std::string response;
 
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "ctrader/1.0");
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, user_agent.c_str());
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_to_string);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);

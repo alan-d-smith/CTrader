@@ -35,6 +35,20 @@ add_executable(ctrader
         ${IMGUI_SOURCES}
 )
 
+# ---- ImPlot setup ----
+set(IMPLOT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/external/implot)
+if(NOT EXISTS "${IMPLOT_DIR}/implot.h")
+    message(FATAL_ERROR "ImPlot not found in external/implot")
+endif()
+
+set(IMPLOT_SOURCES
+        ${IMPLOT_DIR}/implot.cpp
+        ${IMPLOT_DIR}/implot_items.cpp
+)
+
+target_sources(ctrader PRIVATE ${IMPLOT_SOURCES})
+target_include_directories(ctrader PRIVATE ${IMPLOT_DIR})
+
 # ---- Copy assets and certificates after build ----
 add_custom_command(TARGET ctrader POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_directory
@@ -46,6 +60,14 @@ add_custom_command(TARGET ctrader POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_SOURCE_DIR}/certs/cacert.pem"
         "$<TARGET_FILE_DIR:ctrader>/cacert.pem"
+)
+
+# .env is optional and may not exist (e.g. on a fresh checkout); copy it if present.
+add_custom_command(TARGET ctrader POST_BUILD
+        COMMAND ${CMAKE_COMMAND}
+        -DSRC=${CMAKE_SOURCE_DIR}/.env
+        -DDST=$<TARGET_FILE_DIR:ctrader>
+        -P ${CMAKE_SOURCE_DIR}/cmake/copy_env.cmake
 )
 
 # ---- Include directories ----
