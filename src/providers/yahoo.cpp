@@ -19,24 +19,24 @@ candles parse_yahoo_chart_json(const std::string& payload) {
     candles out;
     try {
         auto j = json::parse(payload);
-        if (!j.contains("chart")) { out.err = "malformed response"; return out; }
+        if (!j.contains("chart")) { out.err = "unexpected response format"; return out; }
         const auto& chart = j["chart"];
 
         if (chart.contains("error") && !chart["error"].is_null()) {
             out.err = (chart["error"].contains("description") && chart["error"]["description"].is_string())
                 ? chart["error"]["description"].get<std::string>()
-                : std::string("yahoo_error");
+                : std::string("Yahoo returned an error");
             return out;
         }
 
         if (!chart.contains("result") || chart["result"].is_null() || chart["result"].empty()) {
-            out.err = "no_data";
+            out.err = "no data for this range";
             return out;
         }
 
         const auto& result0 = chart["result"][0];
         if (!result0.contains("timestamp") || result0["timestamp"].is_null()) {
-            out.err = "no_data";
+            out.err = "no data for this range";
             return out;
         }
 
@@ -44,7 +44,7 @@ candles parse_yahoo_chart_json(const std::string& payload) {
         const auto& quotes = result0["indicators"]["quote"];
         if (!result0.contains("indicators") || !result0["indicators"].contains("quote") ||
             quotes.empty() || !quotes[0].contains("close")) {
-            out.err = "no_data";
+            out.err = "no data for this range";
             return out;
         }
         const auto& q0 = quotes[0];
@@ -71,10 +71,10 @@ candles parse_yahoo_chart_json(const std::string& payload) {
             out.c.push_back(closes[i].get<double>());
         }
 
-        if (out.t.empty()) { out.err = "no_data"; return out; }
+        if (out.t.empty()) { out.err = "no data for this range"; return out; }
         out.ok = true;
-    } catch (const std::exception& e) {
-        out.err = e.what();
+    } catch (const std::exception&) {
+        out.err = "unexpected response format";
     }
     return out;
 }

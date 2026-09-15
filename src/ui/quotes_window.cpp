@@ -1,11 +1,21 @@
 #include "quotes_window.hpp"
 #include "imgui.h"
+#include "article_window.hpp"
 #include "price_chart.hpp"
 
 #include <algorithm>
 #include <cstdio>
 #include <ctime>
+#include <thread>
 #include <utility>
+
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 
 namespace {
 std::string trim(const std::string& s) {
@@ -14,13 +24,35 @@ std::string trim(const std::string& s) {
     if (a == std::string::npos) return {};
     return s.substr(a, b - a + 1);
 }
+
+std::wstring to_wide(const std::string& s) {
+    if (s.empty()) return {};
+    const int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
+    std::wstring out(static_cast<size_t>(n), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), out.data(), n);
+    return out;
+}
+
+// Native Windows dialog on its own thread, so it doesn't block the render loop.
+void show_debug_popup(const std::string& title, const request_debug_view& dbg) {
+    std::string body = title + "\n\n"
+        + "URL: " + dbg.url + "\n"
+        + "HTTP status: " + std::to_string(dbg.http_status) + "\n"
+        + "cURL code: " + std::to_string(dbg.curl_code) + "\n";
+    if (!dbg.curl_error.empty()) body += "cURL error: " + dbg.curl_error + "\n";
+    if (!dbg.body_snippet.empty()) body += "\nResponse body:\n" + dbg.body_snippet;
+
+    std::thread([text = to_wide(body)] {
+        MessageBoxW(nullptr, text.c_str(), L"CTrader - Debug details",
+                    MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
+    }).detach();
+}
 } // namespace
 
 void draw_quotes_window(std::vector<std::string>& symbols,
                         bool last_request_ok,
                         const std::string& last_error,
                         const std::vector<QuoteRow>& quotes,
-                        const request_debug_view* dbg,
                         std::chrono::system_clock::time_point last_sync,
                         const std::vector<LogEntry>& log_lines,
                         // chart (OHLC):
@@ -34,7 +66,9 @@ void draw_quotes_window(std::vector<std::string>& symbols,
                         const std::vector<double>& chart_opens,
                         const std::vector<double>& chart_highs,
                         const std::vector<double>& chart_lows,
-                        const std::vector<double>& chart_closes)
+                        const std::vector<double>& chart_closes,
+                        const std::vector<NewsItem>& news,
+                        bool news_loading)
 
 {
     refresh_chart_out = false;
@@ -56,6 +90,13 @@ void draw_quotes_window(std::vector<std::string>& symbols,
         | ImGuiWindowFlags_NoNavFocus;
 
     ImGui::Begin("CTrader - Quotes", nullptr, win_flags);
+
+    // ---- Split off a news column on the right; everything else goes left ----
+    const float full_w = ImGui::GetContentRegionAvail().x;
+    const float news_w = std::min(340.0f, full_w * 0.25f);
+    const float main_w = full_w - news_w - ImGui::GetStyle().ItemSpacing.x;
+
+    ImGui::BeginChild("main_col", ImVec2(main_w, 0), false);
 
     // ---- Bottom row height: sized to fit the ticker table's rows, with a floor ----
     const float row_h = ImGui::GetTextLineHeightWithSpacing();
@@ -157,37 +198,43 @@ void draw_quotes_window(std::vector<std::string>& symbols,
 
         ImGui::Separator();
 
-        if (!last_request_ok && dbg) {
-            if (ImGui::CollapsingHeader("Debug details", ImGuiTreeNodeFlags_DefaultOpen)) {
-                ImGui::TextWrapped("URL: %s", dbg->url.c_str());
-                ImGui::Text("HTTP status: %ld", dbg->http_status);
-                ImGui::Text("cURL code: %d", dbg->curl_code);
-                if (!dbg->curl_error.empty()) {
-                    ImGui::TextWrapped("cURL error: %s", dbg->curl_error.c_str());
-                }
-                if (!dbg->body_snippet.empty()) {
-                    ImGui::SeparatorText("Response body");
-                    ImGui::BeginChild("resp_snip", ImVec2(0, 120), true, ImGuiWindowFlags_HorizontalScrollbar);
-                    ImGui::TextUnformatted(dbg->body_snippet.c_str());
-                    ImGui::EndChild();
-                }
-            }
-            ImGui::Separator();
-        }
-
         // Persistent history of status changes - unlike the summary line
         // above, entries here stay even after the state clears back to OK.
         ImGui::BeginChild("log_scroll", ImVec2(0, 0), false);
-        for (const auto& entry : log_lines) {
+        for (size_t i = 0; i < log_lines.size(); ++i) {
+            const auto& entry = log_lines[i];
             ImVec4 col;
             switch (entry.level) {
                 case LogLevel::Error:   col = ImVec4(1.0f, 0.5f, 0.5f, 1.0f); break;
                 case LogLevel::Success: col = ImVec4(0.5f, 1.0f, 0.5f, 1.0f); break;
                 default:                col = ImGui::GetStyle().Colors[ImGuiCol_Text]; break;
             }
-            ImGui::PushStyleColor(ImGuiCol_Text, col);
-            ImGui::TextWrapped("%s", entry.text.c_str());
-            ImGui::PopStyleColor();
+            ImGui::PushID(static_cast<int>(i));
+            if (entry.has_debug) {
+                // Selectable doesn't wrap, so size it to the wrapped text's
+                // height and draw the wrapped text over it to keep it clickable.
+                const std::string label = entry.text + "  [details]";
+                float wrap_w = ImGui::GetContentRegionAvail().x;
+                if (wrap_w < 1.0f) wrap_w = 1.0f;
+                const ImVec2 text_size = ImGui::CalcTextSize(label.c_str(), nullptr, false, wrap_w);
+                const ImVec2 start = ImGui::GetCursorPos();
+
+                if (ImGui::Selectable("##entry", false, ImGuiSelectableFlags_None, ImVec2(wrap_w, text_size.y))) {
+                    show_debug_popup(entry.text, entry.debug);
+                }
+
+                ImGui::SetCursorPos(start);
+                ImGui::PushTextWrapPos(0.0f);
+                ImGui::PushStyleColor(ImGuiCol_Text, col);
+                ImGui::TextUnformatted(label.c_str());
+                ImGui::PopStyleColor();
+                ImGui::PopTextWrapPos();
+            } else {
+                ImGui::PushStyleColor(ImGuiCol_Text, col);
+                ImGui::TextWrapped("%s", entry.text.c_str());
+                ImGui::PopStyleColor();
+            }
+            ImGui::PopID();
         }
         if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 1.0f) {
             ImGui::SetScrollHereY(1.0f);
@@ -308,6 +355,59 @@ void draw_quotes_window(std::vector<std::string>& symbols,
             }
 
             ImGui::EndTable();
+        }
+    }
+    ImGui::EndChild();
+
+    ImGui::EndChild(); // main_col
+
+    ImGui::SameLine();
+
+    // ---- News column (right, full height) ----
+    ImGui::BeginChild("news_pane", ImVec2(0, 0), true);
+    {
+        ImGui::TextUnformatted(selected_symbol.empty() ? "News" : ("News - " + selected_symbol).c_str());
+        ImGui::Separator();
+
+        if (news.empty()) {
+            ImGui::TextDisabled(news_loading ? "Loading news..." : "No recent news.");
+        }
+
+        for (size_t i = 0; i < news.size(); ++i) {
+            const auto& item = news[i];
+            ImGui::PushID(static_cast<int>(i));
+
+            float wrap_w = ImGui::GetContentRegionAvail().x;
+            if (wrap_w < 1.0f) wrap_w = 1.0f;
+            const ImVec2 text_size = ImGui::CalcTextSize(item.headline.c_str(), nullptr, false, wrap_w);
+            const ImVec2 start = ImGui::GetCursorPos();
+
+            if (ImGui::Selectable("##headline", false, ImGuiSelectableFlags_None, ImVec2(wrap_w, text_size.y))) {
+                show_article_window(item);
+            }
+
+            ImGui::SetCursorPos(start);
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextUnformatted(item.headline.c_str());
+            ImGui::PopTextWrapPos();
+
+            char when[32] = "";
+            if (item.datetime > 0) {
+                const std::time_t t = static_cast<std::time_t>(item.datetime);
+                std::tm tmv{};
+                localtime_s(&tmv, &t);
+                std::strftime(when, sizeof(when), "%d %b  %H:%M", &tmv);
+            }
+            const std::string outlet = !item.publisher.empty()
+                ? item.publisher
+                : (item.source.empty() ? std::string() : "via " + item.source);
+            if (!outlet.empty() || when[0]) {
+                ImGui::TextDisabled("%s%s%s", outlet.c_str(),
+                                    (!outlet.empty() && when[0]) ? "  -  " : "", when);
+            }
+
+            ImGui::Separator();
+            ImGui::PopID();
         }
     }
     ImGui::EndChild();

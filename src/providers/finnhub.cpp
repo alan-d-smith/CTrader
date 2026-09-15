@@ -45,3 +45,37 @@ std::string parse_finnhub_profile_name(const std::string& payload) {
     } catch (...) {}
     return "";
 }
+
+std::string build_finnhub_company_news_url(const std::string& symbol, const std::string& api_key,
+                                           const std::string& from, const std::string& to) {
+    std::ostringstream oss;
+    oss << "https://finnhub.io/api/v1/company-news?symbol=" << symbol
+        << "&from=" << from << "&to=" << to << "&token=" << api_key;
+    return oss.str();
+}
+
+std::vector<NewsItem> parse_finnhub_news_json(const std::string& payload) {
+    std::vector<NewsItem> out;
+    try {
+        auto j = json::parse(payload);
+        if (!j.is_array()) return out;
+
+        for (const auto& item : j) {
+            if (!item.is_object()) continue;
+            NewsItem n;
+            auto str_field = [&](const char* key, std::string& dest) {
+                if (item.contains(key) && item[key].is_string()) dest = item[key].get<std::string>();
+            };
+            str_field("headline", n.headline);
+            str_field("summary", n.summary);
+            str_field("source", n.source);
+            str_field("url", n.url);
+            if (item.contains("datetime") && item["datetime"].is_number()) {
+                n.datetime = item["datetime"].get<int64_t>();
+            }
+            if (n.headline.empty()) continue;
+            out.push_back(std::move(n));
+        }
+    } catch (...) {}
+    return out;
+}

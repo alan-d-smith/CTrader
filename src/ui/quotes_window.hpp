@@ -2,6 +2,7 @@
 #include <string>
 #include <vector>
 #include <chrono>
+#include "../data/news_item.hpp"
 #include "../data/quote_row.hpp"
 
 struct request_debug_view {
@@ -17,6 +18,8 @@ enum class LogLevel { Info, Success, Error };
 struct LogEntry {
     std::string text;
     LogLevel level = LogLevel::Info;
+    bool has_debug = false;
+    request_debug_view debug; // snapshot of the failing request, kept with the entry
 };
 
 // sets refresh_chart_out to true if "Refresh Chart" is clicked; sets
@@ -27,7 +30,6 @@ void draw_quotes_window(std::vector<std::string>& symbols,
                         bool last_request_ok,
                         const std::string& last_error,
                         const std::vector<QuoteRow>& quotes,
-                        const request_debug_view* dbg,
                         std::chrono::system_clock::time_point last_sync,
                         const std::vector<LogEntry>& log_lines,
                         // chart (OHLC):
@@ -41,4 +43,7 @@ void draw_quotes_window(std::vector<std::string>& symbols,
                         const std::vector<double>& chart_opens,
                         const std::vector<double>& chart_highs,
                         const std::vector<double>& chart_lows,
-                        const std::vector<double>& chart_closes);
+                        const std::vector<double>& chart_closes,
+                        // news for the selected symbol:
+                        const std::vector<NewsItem>& news,
+                        bool news_loading);
