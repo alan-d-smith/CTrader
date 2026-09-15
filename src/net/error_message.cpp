@@ -1,5 +1,6 @@
 #include "error_message.hpp"
 #include <cctype>
+#include "../util/text.hpp"
 #include "../third_party/json.hpp"
 using json = nlohmann::json;
 
@@ -96,7 +97,7 @@ std::string describe_http_error(long http_status, int curl_code,
     const char* reason = reason_phrase(http_status);
     if (reason) msg += std::string(" ") + reason;
 
-    const std::string detail = message_from_body(body);
+    const std::string detail = to_ascii_punctuation(message_from_body(body));
     if (!detail.empty() && !(reason && iequals(detail, reason))) msg += ": " + detail;
     return msg;
 }

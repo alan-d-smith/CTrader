@@ -1,5 +1,6 @@
 #include "yahoo.hpp"
 #include <sstream>
+#include "../util/text.hpp"
 #include "../third_party/json.hpp"
 using json = nlohmann::json;
 
@@ -103,7 +104,7 @@ std::map<std::string, std::string> parse_yahoo_quote_names_json(const std::strin
             } else if (item.contains("shortName") && item["shortName"].is_string()) {
                 name = item["shortName"].get<std::string>();
             }
-            if (!name.empty()) out[sym] = name;
+            if (!name.empty()) out[sym] = to_ascii_punctuation(name);
         }
     } catch (...) {}
     return out;

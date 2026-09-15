@@ -1,5 +1,6 @@
 #include "finnhub.hpp"
 #include <sstream>
+#include "../util/text.hpp"
 #include "../third_party/json.hpp"
 using json = nlohmann::json;
 
@@ -40,7 +41,7 @@ std::string parse_finnhub_profile_name(const std::string& payload) {
     try {
         auto j = json::parse(payload);
         if (j.contains("name") && j["name"].is_string()) {
-            return j["name"].get<std::string>();
+            return to_ascii_punctuation(j["name"].get<std::string>());
         }
     } catch (...) {}
     return "";
@@ -64,7 +65,9 @@ std::vector<NewsItem> parse_finnhub_news_json(const std::string& payload) {
             if (!item.is_object()) continue;
             NewsItem n;
             auto str_field = [&](const char* key, std::string& dest) {
-                if (item.contains(key) && item[key].is_string()) dest = item[key].get<std::string>();
+                if (item.contains(key) && item[key].is_string()) {
+                    dest = to_ascii_punctuation(item[key].get<std::string>());
+                }
             };
             str_field("headline", n.headline);
             str_field("summary", n.summary);
